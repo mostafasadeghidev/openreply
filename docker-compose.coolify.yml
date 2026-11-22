@@ -1,0 +1,97 @@
+# OpenReply on Coolify, from the prebuilt image (no build on the server).
+#
+# The image is built by .github/workflows/ghcr.yml and pulled here, because
+# `next build` needs 1.5-2.5 GB of RAM and would starve a small VPS.
+#
+# In Coolify: + New -> Docker Compose Empty -> paste this file. Set the domain
+# on the `web` service only (https://your-domain), then fill the variables
+# below under Environment Variables. Every ${VAR:?} must be set.
+#
+# web, worker and cron share one image and one set of variables. The database
+# URL and Redis URL point at the services in this file, so nothing here is
+# reachable from outside: only `web` is exposed, through Coolify's proxy.
+
+x-app: &app
+  image: ghcr.io/mostafasadeghidev/openreply:latest
+  restart: unless-stopped
+  environment: &app-env
+    NODE_ENV: production
+    NEXTAUTH_URL: ${NEXTAUTH_URL:?}
+    AUTH_TRUST_HOST: "true"
+    NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:?}
+    CRON_SECRET: ${CRON_SECRET:?}
+    ENCRYPTION_KEY: ${ENCRYPTION_KEY:?}
+    DATABASE_URL: postgresql://openreply:${POSTGRES_PASSWORD:?}@openreply-db:5432/openreply
+    REDIS_URL: redis://openreply-redis:6379
+    EMAIL_SERVER: ${EMAIL_SERVER:?}
+    EMAIL_FROM: ${EMAIL_FROM:?}
+    ALLOWED_EMAILS: ${ALLOWED_EMAILS:-}
+    META_GRAPH_API_VERSION: ${META_GRAPH_API_VERSION:-v25.0}
+  depends_on:
+    openreply-db:
+      condition: service_healthy
+    openreply-redis:
+      condition: service_healthy
+
+services:
+  openreply-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: openreply
+      POSTGRES_USER: openreply
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}
+    volumes:
+      - openreply-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U openreply -d openreply"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  openreply-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # BullMQ needs noeviction: an evicted job key is a lost DM.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - openreply-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  web:
+    <<: *app
+    # Migrations run on every start, before the server (they cannot run at
+    # build time: the database is not reachable then).
+    command: ["sh", "-c", "npx prisma migrate deploy && exec npm run start"]
+    expose:
+      - "3000"
+    healthcheck:
+      # Liveness only: /api/health answers 503 while the worker heartbeat is
+      # missing, which must not mark the web app unhealthy.
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(() => process.exit(0), () => process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  worker:
+    <<: *app
+    command: ["npm", "run", "worker"]
+
+  cron:
+    <<: *app
+    command: ["sh", "scripts/cron.sh"]
+    environment:
+      <<: *app-env
+      CRON_BASE_URL: http://web:3000
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  openreply-pgdata:
+  openreply-redisdata:
